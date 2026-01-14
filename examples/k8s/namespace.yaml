@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: greeter-demo
+  labels:
+    app.kubernetes.io/name: greeter-demo
+    app.kubernetes.io/part-of: tonic-lb-k8s-example

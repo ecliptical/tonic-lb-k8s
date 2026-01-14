@@ -88,6 +88,52 @@ discover(config, tx, move |addr| {
 });
 ```
 
+## RBAC Requirements
+
+Applications using this crate require Kubernetes RBAC permissions to watch `EndpointSlice` resources.
+
+| API Group | Resource | Verbs |
+|-----------|----------|-------|
+| `discovery.k8s.io` | `endpointslices` | `list`, `watch` |
+
+### Example Role
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: endpointslice-reader
+  namespace: <your-namespace>
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: <your-app>-endpointslice-reader
+  namespace: <your-namespace>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: endpointslice-reader
+subjects:
+  - kind: ServiceAccount
+    name: <your-service-account>
+    namespace: <your-namespace>
+```
+
+For cross-namespace discovery, use a `ClusterRole` and `ClusterRoleBinding` instead.
+
+## Examples
+
+See the [examples](examples/) directory for a complete demonstration including:
+- A sample gRPC server and client
+- Dockerfiles for Alpine/musl builds
+- Kubernetes manifests
+- Deployment script
+
 ## License
 
 Licensed under the [MIT license](LICENSE).

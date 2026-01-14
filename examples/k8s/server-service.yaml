@@ -1,0 +1,21 @@
+# Headless Service for the greeter server
+# This service does NOT load balance - it exposes individual pod IPs
+# The client uses tonic-lb-k8s to discover endpoints via EndpointSlice
+apiVersion: v1
+kind: Service
+metadata:
+  name: greeter-server
+  namespace: greeter-demo
+  labels:
+    app.kubernetes.io/name: greeter-server
+    app.kubernetes.io/part-of: tonic-lb-k8s-example
+spec:
+  # Headless service - no cluster IP
+  clusterIP: None
+  selector:
+    app: greeter-server
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+      protocol: TCP

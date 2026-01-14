@@ -1,0 +1,44 @@
+# Build stage
+FROM rust:1.88-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache musl-dev protobuf-dev
+
+# Create minimal non-root user for runtime (no shell, no home directory)
+RUN addgroup -g 1000 app && adduser -u 1000 -G app -D -H -s /sbin/nologin app
+
+WORKDIR /app
+
+# Copy the entire project
+COPY . .
+
+# Build the server example in release mode
+RUN cargo build --release --features examples --example greeter-server
+
+# Runtime stage
+FROM scratch
+
+# Copy CA certificates for TLS
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Copy user/group files for non-root execution
+COPY --from=builder /etc/passwd /etc/passwd
+COPY --from=builder /etc/group /etc/group
+
+WORKDIR /app
+
+# Copy the binary from builder
+COPY --from=builder /app/target/release/examples/greeter-server /app/greeter-server
+
+# Run as non-root user
+USER app
+
+# Expose the gRPC port
+EXPOSE 50051
+
+# Set environment variables
+ENV GRPC_PORT=50051
+ENV RUST_LOG=info
+
+# Run the server
+CMD ["/app/greeter-server"]

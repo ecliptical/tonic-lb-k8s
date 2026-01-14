@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package greeter;
+
+// A simple greeting service for demonstrating tonic-lb-k8s.
+service Greeter {
+  // Sends a greeting and returns a reply with the pod name.
+  rpc SayHello (HelloRequest) returns (HelloReply);
+}
+
+// The request message containing the user's name.
+message HelloRequest {
+  string name = 1;
+}
+
+// The response message containing the greeting and server info.
+message HelloReply {
+  string message = 1;
+  // The hostname/pod name of the server that handled the request.
+  string served_by = 2;
+}

@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: greeter-server
+  namespace: greeter-demo
+  labels:
+    app.kubernetes.io/name: greeter-server
+    app.kubernetes.io/part-of: tonic-lb-k8s-example
+spec:
+  # Multiple replicas to demonstrate load balancing
+  replicas: 3
+  selector:
+    matchLabels:
+      app: greeter-server
+  template:
+    metadata:
+      labels:
+        app: greeter-server
+    spec:
+      containers:
+        - name: greeter-server
+          image: greeter-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 50051
+              protocol: TCP
+          env:
+            - name: GRPC_PORT
+              value: "50051"
+            - name: RUST_LOG
+              value: "info"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 2
+            periodSeconds: 5

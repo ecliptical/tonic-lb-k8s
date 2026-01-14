@@ -133,19 +133,64 @@ tonic-lb-k8s/
 │   └── workflows/
 │       ├── rust-ci.yaml              # Lint, test, coverage
 │       └── dependabot-automerge.yaml # Auto-merge patch/minor
-└── src/
-    ├── lib.rs           # Public exports only
-    └── k8s.rs           # All implementation
+├── src/
+│   ├── lib.rs           # Public exports only
+│   └── k8s.rs           # All implementation
+└── examples/
+    ├── deploy.sh        # Build and deploy examples
+    ├── kind-cluster.sh  # Create/delete local kind cluster
+    ├── README.md        # Example documentation
+    ├── greeter-server.rs
+    ├── greeter-client.rs
+    ├── docker/
+    │   ├── Dockerfile.server
+    │   └── Dockerfile.client
+    ├── k8s/
+    │   ├── namespace.yaml
+    │   ├── server-service.yaml
+    │   ├── server-deployment.yaml
+    │   ├── client-rbac.yaml
+    │   └── client-job.yaml
+    └── proto/
+        └── greeter.proto
 ```
 
 ## Dependencies
 
 - **tonic 0.14**: gRPC framework (channel feature only)
-- **kube 3**: Kubernetes client (aws-lc-rs, client, runtime)
-- **k8s-openapi 0.27**: Kubernetes API types (v1_32)
+- **kube 3**: Kubernetes client (rustls-tls, aws-lc-rs, client, runtime)
+- **k8s-openapi 0.27**: Kubernetes API types (v1_31)
 - **tokio 1**: Async runtime (sync feature only)
 - **futures 0.3**: Stream utilities
 - **tracing 0.1**: Structured logging
+
+## TLS and Root Certificates
+
+### Design Decision
+
+The crate uses `rustls-tls` with `aws-lc-rs` as the crypto backend for connecting to the Kubernetes API server.
+
+**Root Certificate Options**:
+- **Default (no feature)**: Requires system CA certificates in the container (e.g., `/etc/ssl/certs/ca-certificates.crt`)
+- **`webpki-roots` feature**: Embeds Mozilla's root certificates in the binary - ideal for `scratch` or `distroless` images
+
+### Why This Matters
+
+- `aws-lc-rs` is a **crypto backend** for rustls, not a TLS stack itself
+- You need `rustls-tls` to enable the actual TLS layer
+- `webpki-roots` provides embedded CA certificates for scratch images that have no filesystem
+
+### Feature Configuration
+
+```toml
+# For containers with system CA certificates (Alpine, Debian, etc.)
+tonic-lb-k8s = "0.1"
+
+# For scratch/distroless images (no system CA certs)
+tonic-lb-k8s = { version = "0.1", features = ["webpki-roots"] }
+```
+
+**Note**: kube-rs does not expose a `native-roots` feature. Users who need native system certificates should ensure their container image includes CA certificates.
 
 ## Testing Strategy
 
@@ -176,6 +221,8 @@ tonic-lb-k8s/
 The project went through several refinements:
 
 1. Generic key type `K` → simplified to `SocketAddr`
-4. Increased test coverage by extracting testable `process_event()`
+2. Increased test coverage by extracting testable `process_event()`
+3. TLS configuration: `aws-lc-rs` alone is insufficient; need `rustls-tls` + `aws-lc-rs`
+4. Root certificates: Added optional `webpki-roots` feature for scratch images
 
 The guiding principle was **simplicity over flexibility** when the flexibility wasn't clearly needed.

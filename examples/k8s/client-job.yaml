@@ -1,0 +1,44 @@
+# Job that runs the client once to demonstrate load balancing
+# The client sends multiple requests and reports which pods served them
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: greeter-client
+  namespace: greeter-demo
+  labels:
+    app.kubernetes.io/name: greeter-client
+    app.kubernetes.io/part-of: tonic-lb-k8s-example
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app: greeter-client
+    spec:
+      serviceAccountName: greeter-client
+      restartPolicy: Never
+      containers:
+        - name: greeter-client
+          image: greeter-client:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SERVICE_NAME
+              value: "greeter-server"
+            - name: SERVICE_NAMESPACE
+              value: "greeter-demo"
+            - name: GRPC_PORT
+              value: "50051"
+            - name: REQUEST_COUNT
+              value: "20"
+            - name: REQUEST_INTERVAL_MS
+              value: "500"
+            - name: RUST_LOG
+              value: "info"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi

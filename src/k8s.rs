@@ -45,6 +45,7 @@ use kube::{Api, Client};
 use tokio::sync::mpsc::Sender;
 use tonic::transport::Endpoint;
 use tonic::transport::channel::Change;
+use tracing::{debug, error, warn};
 
 /// Error type for discovery failures.
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -158,7 +159,7 @@ where
 {
     tokio::spawn(async move {
         if let Err(e) = discovery_loop(tx, config, build).await {
-            tracing::error!("Kubernetes endpoint watcher failed: {e}");
+            error!("Kubernetes endpoint watcher failed: {e}");
         }
     });
 }
@@ -185,10 +186,9 @@ where
     let stream = watcher::watcher(slices, watcher_config).default_backoff();
     tokio::pin!(stream);
 
-    tracing::debug!(
+    debug!(
         "Starting Kubernetes endpoint watch for {namespace}/{} on port {:?}",
-        config.service_name,
-        config.port
+        config.service_name, config.port
     );
 
     while let Some(event) = stream.try_next().await? {
@@ -201,12 +201,12 @@ where
             };
 
             if tx.send(change).await.is_err() {
-                tracing::warn!("channel closed, stopping Kubernetes watcher");
+                warn!("channel closed, stopping Kubernetes watcher");
                 return Ok(());
             }
         }
 
-        tracing::debug!(
+        debug!(
             "Kubernetes discovery: {} endpoints for {namespace}/{}",
             known.len(),
             config.service_name
@@ -238,7 +238,7 @@ fn process_event(
 
             for addr in current {
                 if known.insert(addr) {
-                    tracing::debug!("adding endpoint: {addr}");
+                    debug!("adding endpoint: {addr}");
                     actions.push(EndpointAction::Insert(addr));
                 }
             }
@@ -252,7 +252,7 @@ fn process_event(
 
             for addr in removed {
                 if known.remove(&addr) {
-                    tracing::debug!("removing endpoint: {addr}");
+                    debug!("removing endpoint: {addr}");
                     actions.push(EndpointAction::Remove(addr));
                 }
             }
@@ -261,7 +261,7 @@ fn process_event(
         }
 
         Event::Init | Event::InitDone => {
-            tracing::debug!("Kubernetes watcher initialization event");
+            debug!("Kubernetes watcher initialization event");
             Vec::new()
         }
     }
