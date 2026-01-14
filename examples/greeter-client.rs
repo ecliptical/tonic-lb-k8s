@@ -128,12 +128,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Print summary
     info!("\n=== Load Balancing Summary ===");
+    let total_successful: u32 = pod_counts.values().sum();
     for (pod, count) in &pod_counts {
         let percentage = (*count as f64 / request_count as f64) * 100.0;
         info!("{pod}: {count} requests ({percentage:.1}%)");
     }
 
     info!("Total pods used: {}", pod_counts.len());
+    info!("Successful requests: {total_successful}/{request_count}");
 
-    Ok(())
+    // Integration test assertions:
+    // 1. At least 80% of requests must succeed
+    // 2. At least 2 different pods must have served requests (proves load balancing works)
+    let success_rate = total_successful as f64 / request_count as f64;
+    let min_pods_required = 2;
+
+    if success_rate >= 0.8 && pod_counts.len() >= min_pods_required {
+        info!(
+            "INTEGRATION_TEST_PASSED: Load balancing verified across {} pods",
+            pod_counts.len()
+        );
+
+        Ok(())
+    } else {
+        error!(
+            "INTEGRATION_TEST_FAILED: success_rate={:.1}%, pods_used={} (need >=80% success, >={} pods)",
+            success_rate * 100.0,
+            pod_counts.len(),
+            min_pods_required
+        );
+
+        std::process::exit(1);
+    }
 }

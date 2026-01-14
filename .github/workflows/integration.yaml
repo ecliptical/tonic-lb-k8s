@@ -1,0 +1,116 @@
+on:
+  workflow_run:
+    workflows: ["Rust CI"]
+    types:
+      - completed
+    branches:
+      - main
+  # Allow manual triggering for testing
+  workflow_dispatch:
+
+name: Integration Tests
+
+jobs:
+  kind-integration:
+    name: Run examples in kind cluster
+    runs-on: ubuntu-latest
+    # Only run if the triggering workflow succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    
+    steps:
+      - name: Check out the source code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: tonic-lb-k8s
+          wait: 120s
+
+      - name: Build server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: examples/docker/Dockerfile.server
+          push: false
+          load: true
+          tags: greeter-server:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build client image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: examples/docker/Dockerfile.client
+          push: false
+          load: true
+          tags: greeter-client:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Load images into kind
+        run: |
+          kind load docker-image greeter-server:latest --name tonic-lb-k8s
+          kind load docker-image greeter-client:latest --name tonic-lb-k8s
+
+      - name: Deploy to kind cluster
+        run: |
+          kubectl apply -f examples/k8s/namespace.yaml
+          kubectl apply -f examples/k8s/server-service.yaml
+          kubectl apply -f examples/k8s/server-deployment.yaml
+          kubectl apply -f examples/k8s/client-rbac.yaml
+
+      - name: Wait for server pods to be ready
+        run: |
+          kubectl wait --namespace greeter-demo \
+            --for=condition=ready pod \
+            --selector=app=greeter-server \
+            --timeout=120s
+
+      - name: Show server pods
+        run: |
+          echo "=== Server Pods ==="
+          kubectl get pods -n greeter-demo -l app=greeter-server -o wide
+          echo ""
+          echo "=== EndpointSlices ==="
+          kubectl get endpointslices -n greeter-demo -l kubernetes.io/service-name=greeter-server -o yaml
+
+      - name: Run client job
+        run: kubectl apply -f examples/k8s/client-job.yaml
+
+      - name: Wait for client job to complete
+        run: |
+          kubectl wait --namespace greeter-demo \
+            --for=condition=complete job/greeter-client \
+            --timeout=120s
+
+      - name: Get client logs
+        run: |
+          echo "=== Client Logs ==="
+          kubectl logs -n greeter-demo -l app=greeter-client
+
+      - name: Verify load balancing worked
+        run: |
+          # Get the client logs and check for the integration test marker
+          logs=$(kubectl logs -n greeter-demo -l app=greeter-client)
+          echo "$logs"
+          
+          # Check that the test passed (client exits with special marker)
+          if echo "$logs" | grep -q "INTEGRATION_TEST_PASSED"; then
+            echo "✅ Integration test passed: Load balancing verified"
+            exit 0
+          else
+            echo "❌ Integration test failed: Load balancing not verified"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kubectl delete namespace greeter-demo --ignore-not-found=true || true
