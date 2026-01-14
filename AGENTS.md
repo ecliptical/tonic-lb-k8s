@@ -168,29 +168,37 @@ tonic-lb-k8s/
 
 ### Design Decision
 
-The crate uses `rustls-tls` with `aws-lc-rs` as the crypto backend for connecting to the Kubernetes API server.
+The crate uses `rustls-tls` with `aws-lc-rs` as the crypto backend for connecting to the Kubernetes API server. Two optional features coordinate TLS root certificate configuration for both kube and tonic dependencies.
 
 **Root Certificate Options**:
-- **Default (no feature)**: Requires system CA certificates in the container (e.g., `/etc/ssl/certs/ca-certificates.crt`)
-- **`webpki-roots` feature**: Embeds Mozilla's root certificates in the binary - ideal for `scratch` or `distroless` images
+- **Default (no feature)**: kube uses system CA certificates; tonic has no root cert configuration from this crate
+- **`tls-native-roots` feature**: Explicitly enables system/native root certificates for tonic (kube uses them by default)
+- **`tls-webpki-roots` feature**: Embeds Mozilla's root certificates for both kube and tonic - ideal for `scratch` or `distroless` images
 
 ### Why This Matters
 
 - `aws-lc-rs` is a **crypto backend** for rustls, not a TLS stack itself
 - You need `rustls-tls` to enable the actual TLS layer
-- `webpki-roots` provides embedded CA certificates for scratch images that have no filesystem
+- Root certificate features coordinate both dependencies to use the same certificate source
+- For kube: `rustls-tls` uses native certs by default; `webpki-roots` feature switches to embedded certs
+- For tonic: requires explicit feature flags (`tls-native-roots` or `tls-webpki-roots`)
 
 ### Feature Configuration
 
 ```toml
-# For containers with system CA certificates (Alpine, Debian, etc.)
+# Default: kube uses system CA certs, tonic has no root certs configured by this crate
 tonic-lb-k8s = "0.1"
 
+# For containers with system CA certificates (Alpine, Debian, etc.)
+# Explicitly enables native roots for tonic
+tonic-lb-k8s = { version = "0.1", features = ["tls-native-roots"] }
+
 # For scratch/distroless images (no system CA certs)
-tonic-lb-k8s = { version = "0.1", features = ["webpki-roots"] }
+# Enables webpki-roots for both kube and tonic
+tonic-lb-k8s = { version = "0.1", features = ["tls-webpki-roots"] }
 ```
 
-**Note**: kube-rs does not expose a `native-roots` feature. Users who need native system certificates should ensure their container image includes CA certificates.
+**Note**: The features are not mutually exclusive, but you should choose one based on your deployment environment.
 
 ## Testing Strategy
 
@@ -223,6 +231,6 @@ The project went through several refinements:
 1. Generic key type `K` → simplified to `SocketAddr`
 2. Increased test coverage by extracting testable `process_event()`
 3. TLS configuration: `aws-lc-rs` alone is insufficient; need `rustls-tls` + `aws-lc-rs`
-4. Root certificates: Added optional `webpki-roots` feature for scratch images
+4. Root certificates: Added `tls-native-roots` and `tls-webpki-roots` features to coordinate root certificate configuration for both kube and tonic dependencies
 
 The guiding principle was **simplicity over flexibility** when the flexibility wasn't clearly needed.

@@ -37,6 +37,26 @@ tonic = "0.14"
 tonic-lb-k8s = "0.1"
 ```
 
+### TLS Root Certificates
+
+This crate uses `rustls` for TLS. Choose a root certificate feature based on your deployment:
+
+```toml
+# For containers with system CA certificates (Alpine, Debian, etc.)
+# Enables native/system roots for tonic
+tonic-lb-k8s = { version = "0.1", features = ["tls-native-roots"] }
+
+# For scratch/distroless images (no system CA certs)
+# Embeds Mozilla's root certs for both kube and tonic
+tonic-lb-k8s = { version = "0.1", features = ["tls-webpki-roots"] }
+```
+
+| Feature | kube | tonic | Use case |
+|---------|------|-------|----------|
+| *(none)* | System certs (default) | No roots configured | kube-only TLS |
+| `tls-native-roots` | System certs (default) | System certs | Containers with CA certs |
+| `tls-webpki-roots` | Embedded Mozilla certs | Embedded Mozilla certs | scratch/distroless |
+
 ## Usage
 
 ```rust

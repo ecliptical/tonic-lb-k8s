@@ -20,8 +20,16 @@ tracing = "0.1"
 
 [features]
 examples = ["dep:tonic-prost-build"]
-# Use Mozilla's root certificates (embedded in binary, ideal for scratch/distroless images)
-webpki-roots = ["kube/webpki-roots"]
+
+# TLS root certificate features - choose one based on your deployment environment:
+#
+# Use native/system root certificates (default behavior for kube, explicit for tonic)
+# Best for containers with system CA certificates (Alpine, Debian, etc.)
+tls-native-roots = ["tonic/tls-native-roots"]
+
+# Use Mozilla's root certificates (embedded in binary)
+# Best for scratch/distroless images that have no system CA certificates
+tls-webpki-roots = ["kube/webpki-roots", "tonic/tls-webpki-roots"]
 
 [dev-dependencies]
 prost = "0.14"
