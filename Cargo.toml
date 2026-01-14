@@ -19,7 +19,6 @@ tonic = { version = "0.14", default-features = false, features = ["channel"] }
 tracing = "0.1"
 
 [features]
-# examples = ["dep:tonic-prost-build", "webpki-roots"]
 examples = ["dep:tonic-prost-build"]
 # Use Mozilla's root certificates (embedded in binary, ideal for scratch/distroless images)
 webpki-roots = ["kube/webpki-roots"]
