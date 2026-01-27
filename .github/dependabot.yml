@@ -6,10 +6,10 @@ updates:
       interval: "weekly"
     assignees:
       - "pnehrer"
-    groups:
-      patch-updates:
+    ignore:
+      - dependency-name: "*"
         update-types:
-          - "patch"
+          - "version-update:semver-patch"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
