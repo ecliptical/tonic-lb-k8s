@@ -4,7 +4,7 @@ This document captures the design decisions, patterns, and lessons learned durin
 
 ## Project Overview
 
-**Purpose**: Kubernetes endpoint discovery for Tonic gRPC load balancing.
+**Purpose**: Tonic client load balancing for Kubernetes.
 
 **Problem Solved**: When using gRPC (HTTP/2) with Kubernetes, standard `ClusterIP` services don't load balance effectively because HTTP/2 multiplexes all requests over a single long-lived TCP connection. This crate watches Kubernetes `EndpointSlice` resources and feeds endpoint changes to a user-provided Tonic balance channel.
 

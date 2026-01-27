@@ -2,18 +2,16 @@
 #![deny(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-//! Kubernetes endpoint discovery for [Tonic](https://docs.rs/tonic) gRPC load balancing.
+//! [Tonic](https://docs.rs/tonic) client load balancing for Kubernetes.
 //!
-//! When using gRPC (HTTP/2) with Kubernetes, standard `ClusterIP` services don't load balance
-//! effectively because HTTP/2 multiplexes all requests over a single long-lived TCP connection.
 //! This crate watches Kubernetes `EndpointSlice` resources and feeds endpoint changes to a
-//! user-provided Tonic balance channel.
+//! Tonic balance channel, enabling client-side load balancing across pod replicas.
 //!
-//! # Features
+//! # Why?
 //!
-//! - **Kubernetes API discovery**: Real-time endpoint updates via `EndpointSlice` watch
-//! - **User-controlled channels**: You create the channel and endpoints however you want
-//! - **Dynamic endpoint management**: Automatically adds/removes backends as pods scale
+//! Standard Kubernetes `ClusterIP` services don't load balance gRPC effectively. HTTP/2
+//! multiplexes all requests over a single long-lived TCP connection, so all traffic goes
+//! to one pod. This crate handles endpoint discovery and connection management automatically.
 //!
 //! # Usage
 //!

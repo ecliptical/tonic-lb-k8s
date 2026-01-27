@@ -1,6 +1,6 @@
 [package]
 name = "tonic-lb-k8s"
-description = "Kubernetes endpoint discovery for tonic gRPC load balancing"
+description = "Tonic client load balancing for Kubernetes"
 version = "0.1.0"
 repository = "https://github.com/ecliptical/tonic-lb-k8s"
 authors = ["Peter Nehrer <pnehrer@eclipticalsoftware.com>"]

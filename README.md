@@ -1,31 +1,24 @@
-# Kubernetes Endpoint Discovery for Tonic
+# Tonic Client Load Balancing for Kubernetes
 
 [![Crates.io](https://img.shields.io/crates/v/tonic-lb-k8s.svg)](https://crates.io/crates/tonic-lb-k8s/)
 [![Docs.rs](https://docs.rs/tonic-lb-k8s/badge.svg)](https://docs.rs/tonic-lb-k8s/)
 [![CI](https://github.com/ecliptical/tonic-lb-k8s/actions/workflows/rust-ci.yaml/badge.svg)](https://github.com/ecliptical/tonic-lb-k8s/actions/workflows/rust-ci.yaml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Kubernetes endpoint discovery for [Tonic](https://crates.io/crates/tonic/) gRPC load balancing.
+[Tonic](https://crates.io/crates/tonic/) client load balancing for Kubernetes.
 
-## The Problem
+This crate provides client-side load balancing for Tonic-based gRPC applications running in Kubernetes. It does that by watching the target service's `EndpointSlice`s and feeding changes to the client channel, thus enabling responsive load balancing across pod replicas.
 
-When using gRPC (HTTP/2) with Kubernetes, standard ClusterIP services don't load balance effectively
-because HTTP/2 multiplexes all requests over a single long-lived TCP connection. Headless services
-expose individual pod IPs, but the client needs to:
+## Why?
+
+Standard Kubernetes `ClusterIP` services don't load balance gRPC effectively. HTTP/2 multiplexes all requests over a single long-lived TCP connection, so all traffic goes to one pod. Headless services expose individual pod IPs, but the client must:
 
 1. Discover all pod endpoints
 2. Maintain connections to each
 3. Load balance requests across them
 4. React to pods being added/removed
 
-This crate watches Kubernetes `EndpointSlice` resources and feeds endpoint changes to a
-user-provided Tonic balance channel.
-
-## Features
-
-- **Kubernetes API discovery**: Real-time endpoint updates via `EndpointSlice` watch
-- **User-controlled channels**: You create the channel and endpoints however you want
-- **Dynamic endpoint management**: Automatically adds/removes backends as pods scale
+This crate handles all of that automatically.
 
 ## Installation
 
