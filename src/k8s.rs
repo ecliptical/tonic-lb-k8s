@@ -14,8 +14,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use std::net::SocketAddr;
-//! use std::time::Duration;
+//! use std::{net::SocketAddr, time::Duration};
 //! use tonic::transport::{Channel, Endpoint};
 //! use tonic_lb_k8s::{discover, DiscoveryConfig};
 //!
@@ -34,17 +33,15 @@
 //! let client = MyServiceClient::new(channel);
 //! ```
 
-use std::collections::HashSet;
-use std::net::{IpAddr, SocketAddr};
-
-use futures::TryStreamExt;
+use futures::TryStreamExt as _;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use kube::runtime::WatchStreamExt;
+use kube::runtime::WatchStreamExt as _;
 use kube::runtime::watcher::{self, Config as WatcherConfig, Event};
 use kube::{Api, Client};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use tokio::sync::mpsc::Sender;
-use tonic::transport::Endpoint;
-use tonic::transport::channel::Change;
+use tonic::transport::{Endpoint, channel::Change};
 use tracing::{debug, error, warn};
 
 /// Error type for discovery failures.
@@ -182,7 +179,7 @@ where
     let label_selector = format!("kubernetes.io/service-name={}", config.service_name);
     let watcher_config = WatcherConfig::default().labels(&label_selector);
 
-    let mut known: HashSet<SocketAddr> = HashSet::new();
+    let mut state = DiscoveryState::default();
     let stream = watcher::watcher(slices, watcher_config).default_backoff();
     tokio::pin!(stream);
 
@@ -192,7 +189,7 @@ where
     );
 
     while let Some(event) = stream.try_next().await? {
-        let actions = process_event(&event, &mut known, &config.port);
+        let actions = process_event(&event, &mut state, &config.port);
 
         for action in actions {
             let change = match action {
@@ -208,7 +205,7 @@ where
 
         debug!(
             "Kubernetes discovery: {} endpoints for {namespace}/{}",
-            known.len(),
+            state.refcount.len(),
             config.service_name
         );
     }
@@ -223,46 +220,153 @@ enum EndpointAction {
     Remove(SocketAddr),
 }
 
+/// Per-slice and aggregate state for the discovery loop.
+///
+/// A Kubernetes Service may be backed by multiple `EndpointSlice` objects
+/// (the controller shards slices at ~100 endpoints, and there is typically
+/// one slice per address family). The same address can therefore legally
+/// appear in more than one slice; we must only emit `Remove` once the
+/// last slice referencing it has dropped it.
+#[derive(Debug, Default)]
+struct DiscoveryState {
+    /// For each slice (keyed by its UID), the set of ready addresses we
+    /// last observed in that slice.
+    slices: HashMap<String, HashSet<SocketAddr>>,
+    /// Reference count of each address across all slices. Drives the
+    /// emit-once semantics required by `tonic::transport::channel::Change`.
+    refcount: HashMap<SocketAddr, usize>,
+    /// During an `Init` → `InitDone` window (watcher cold start or restart
+    /// after a disconnect), records the slice UIDs delivered via
+    /// `InitApply`. On `InitDone` we evict slices we did NOT see, so that
+    /// pods that disappeared while we were disconnected are removed from
+    /// the balance channel.
+    init_seen: Option<HashSet<String>>,
+}
+
+impl DiscoveryState {
+    /// Apply a slice: diff against the previously-known set for the same
+    /// slice UID and emit `Insert`/`Remove` actions, updating refcounts.
+    fn apply_slice(&mut self, uid: String, current: HashSet<SocketAddr>) -> Vec<EndpointAction> {
+        let prev = self.slices.remove(&uid).unwrap_or_default();
+        let mut actions = Vec::new();
+
+        // Addresses dropped from this slice
+        for addr in &prev {
+            if !current.contains(addr) {
+                self.decref(*addr, &mut actions);
+            }
+        }
+
+        // Addresses newly present in this slice
+        for addr in &current {
+            if !prev.contains(addr) {
+                self.incref(*addr, &mut actions);
+            }
+        }
+
+        self.slices.insert(uid, current);
+        actions
+    }
+
+    /// Drop a slice entirely (the `EndpointSlice` object was deleted).
+    fn delete_slice(&mut self, uid: &str) -> Vec<EndpointAction> {
+        let Some(prev) = self.slices.remove(uid) else {
+            return Vec::new();
+        };
+
+        let mut actions = Vec::new();
+        for addr in prev {
+            self.decref(addr, &mut actions);
+        }
+
+        actions
+    }
+
+    fn incref(&mut self, addr: SocketAddr, actions: &mut Vec<EndpointAction>) {
+        let count = self.refcount.entry(addr).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            debug!("adding endpoint: {addr}");
+            actions.push(EndpointAction::Insert(addr));
+        }
+    }
+
+    fn decref(&mut self, addr: SocketAddr, actions: &mut Vec<EndpointAction>) {
+        if let Some(count) = self.refcount.get_mut(&addr) {
+            *count -= 1;
+            if *count == 0 {
+                self.refcount.remove(&addr);
+                debug!("removing endpoint: {addr}");
+                actions.push(EndpointAction::Remove(addr));
+            }
+        }
+    }
+}
+
+/// Best-effort identity for an `EndpointSlice`. Prefers the apiserver-
+/// assigned UID; falls back to namespace/name when UID is missing (only
+/// expected in synthetic test fixtures).
+fn slice_id(slice: &EndpointSlice) -> String {
+    if let Some(uid) = slice.metadata.uid.as_deref() {
+        return uid.to_string();
+    }
+
+    let ns = slice.metadata.namespace.as_deref().unwrap_or("");
+    let name = slice.metadata.name.as_deref().unwrap_or("");
+    format!("{ns}/{name}")
+}
+
 /// Processes a watcher event and returns the endpoint actions.
 ///
 /// This function is extracted to enable unit testing of the event processing logic.
 fn process_event(
     event: &Event<EndpointSlice>,
-    known: &mut HashSet<SocketAddr>,
+    state: &mut DiscoveryState,
     port: &Port,
 ) -> Vec<EndpointAction> {
     match event {
-        Event::Apply(slice) | Event::InitApply(slice) => {
+        Event::Apply(slice) => {
+            let uid = slice_id(slice);
             let current = extract_ready_endpoints(slice, port);
-            let mut actions = Vec::new();
+            state.apply_slice(uid, current)
+        }
 
-            for addr in current {
-                if known.insert(addr) {
-                    debug!("adding endpoint: {addr}");
-                    actions.push(EndpointAction::Insert(addr));
-                }
+        Event::InitApply(slice) => {
+            let uid = slice_id(slice);
+            if let Some(seen) = state.init_seen.as_mut() {
+                seen.insert(uid.clone());
             }
-
-            actions
+            let current = extract_ready_endpoints(slice, port);
+            state.apply_slice(uid, current)
         }
 
         Event::Delete(slice) => {
-            let removed = extract_ready_endpoints(slice, port);
-            let mut actions = Vec::new();
+            let uid = slice_id(slice);
+            state.delete_slice(&uid)
+        }
 
-            for addr in removed {
-                if known.remove(&addr) {
-                    debug!("removing endpoint: {addr}");
-                    actions.push(EndpointAction::Remove(addr));
-                }
+        Event::Init => {
+            debug!("Kubernetes watcher init starting");
+            state.init_seen = Some(HashSet::new());
+            Vec::new()
+        }
+
+        Event::InitDone => {
+            debug!("Kubernetes watcher init complete");
+            let seen = state.init_seen.take().unwrap_or_default();
+            let stale_uids: Vec<String> = state
+                .slices
+                .keys()
+                .filter(|uid| !seen.contains(*uid))
+                .cloned()
+                .collect();
+
+            let mut actions = Vec::new();
+            for uid in stale_uids {
+                actions.extend(state.delete_slice(&uid));
             }
 
             actions
-        }
-
-        Event::Init | Event::InitDone => {
-            debug!("Kubernetes watcher initialization event");
-            Vec::new()
         }
     }
 }
@@ -288,10 +392,20 @@ fn extract_ready_endpoints(slice: &EndpointSlice, port: &Port) -> HashSet<Socket
     let mut addrs = HashSet::new();
 
     for ep in &slice.endpoints {
-        // An endpoint is ready if conditions.ready is true or unset (defaults to true)
-        let ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
+        // EndpointConditions semantics (k8s discovery v1):
+        //   * `ready`       - prepared to receive new traffic. `None` is
+        //                     treated as ready.
+        //   * `terminating` - pod is going away; per upstream guidance,
+        //                     load-balancer clients picking targets for
+        //                     NEW connections should treat this as not
+        //                     ready, even if `ready` briefly lags at
+        //                     `Some(true)` during shutdown.
+        let (ready, terminating) = match ep.conditions.as_ref() {
+            Some(c) => (c.ready.unwrap_or(true), c.terminating.unwrap_or(false)),
+            None => (true, false),
+        };
 
-        if !ready {
+        if !ready || terminating {
             continue;
         }
 
@@ -591,105 +705,330 @@ mod tests {
 
     // process_event tests
 
+    /// Helper: a slice with a stable UID so subsequent applies update the
+    /// same per-slice state.
+    fn slice_with(uid: &str, addresses: &[&str], ready: Option<bool>) -> EndpointSlice {
+        slice_with_terminating(uid, addresses, ready, None)
+    }
+
+    fn slice_with_terminating(
+        uid: &str,
+        addresses: &[&str],
+        ready: Option<bool>,
+        terminating: Option<bool>,
+    ) -> EndpointSlice {
+        EndpointSlice {
+            metadata: kube::core::ObjectMeta {
+                name: Some(format!("svc-{uid}")),
+                uid: Some(uid.to_string()),
+                ..Default::default()
+            },
+            endpoints: vec![Endpoint {
+                addresses: addresses.iter().map(|s| (*s).to_string()).collect(),
+                conditions: Some(EndpointConditions {
+                    ready,
+                    terminating,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("valid SocketAddr")
+    }
+
     #[test]
     fn process_event_apply_inserts_new_endpoints() {
-        let slice = EndpointSlice {
-            endpoints: vec![make_endpoint(vec!["10.0.0.1", "10.0.0.2"], Some(true))],
-            ..Default::default()
-        };
+        let slice = slice_with("uid-1", &["10.0.0.1", "10.0.0.2"], Some(true));
 
-        let mut known = HashSet::new();
-        let actions = process_event(&Event::Apply(slice), &mut known, &Port::Number(50051));
+        let mut state = DiscoveryState::default();
+        let actions = process_event(&Event::Apply(slice), &mut state, &Port::Number(50051));
 
         assert_eq!(actions.len(), 2);
-        assert!(actions.contains(&EndpointAction::Insert("10.0.0.1:50051".parse().unwrap())));
-        assert!(actions.contains(&EndpointAction::Insert("10.0.0.2:50051".parse().unwrap())));
-        assert_eq!(known.len(), 2);
+        assert!(actions.contains(&EndpointAction::Insert(addr("10.0.0.1:50051"))));
+        assert!(actions.contains(&EndpointAction::Insert(addr("10.0.0.2:50051"))));
+        assert_eq!(state.refcount.len(), 2);
     }
 
     #[test]
     fn process_event_apply_skips_known_endpoints() {
-        let slice = EndpointSlice {
-            endpoints: vec![make_endpoint(vec!["10.0.0.1", "10.0.0.2"], Some(true))],
-            ..Default::default()
-        };
+        let slice = slice_with("uid-1", &["10.0.0.1", "10.0.0.2"], Some(true));
 
-        let mut known = HashSet::new();
-        known.insert("10.0.0.1:50051".parse().unwrap());
+        let mut state = DiscoveryState::default();
+        // Pre-seed by applying the same slice once
+        let _ = process_event(
+            &Event::Apply(slice_with("uid-1", &["10.0.0.1"], Some(true))),
+            &mut state,
+            &Port::Number(50051),
+        );
 
-        let actions = process_event(&Event::Apply(slice), &mut known, &Port::Number(50051));
+        let actions = process_event(&Event::Apply(slice), &mut state, &Port::Number(50051));
 
-        // Only 10.0.0.2 should be inserted since 10.0.0.1 is already known
-        assert_eq!(actions.len(), 1);
-        assert!(actions.contains(&EndpointAction::Insert("10.0.0.2:50051".parse().unwrap())));
-        assert_eq!(known.len(), 2);
+        // Only 10.0.0.2 is newly added
+        assert_eq!(
+            actions,
+            vec![EndpointAction::Insert(addr("10.0.0.2:50051"))]
+        );
+        assert_eq!(state.refcount.len(), 2);
     }
 
     #[test]
     fn process_event_init_apply_inserts_endpoints() {
-        let slice = EndpointSlice {
-            endpoints: vec![make_endpoint(vec!["10.0.0.1"], Some(true))],
+        let slice = slice_with("uid-1", &["10.0.0.1"], Some(true));
+
+        let mut state = DiscoveryState {
+            init_seen: Some(HashSet::new()),
             ..Default::default()
         };
+        let actions = process_event(&Event::InitApply(slice), &mut state, &Port::Number(50051));
 
-        let mut known = HashSet::new();
-        let actions = process_event(&Event::InitApply(slice), &mut known, &Port::Number(50051));
-
-        assert_eq!(actions.len(), 1);
-        assert!(actions.contains(&EndpointAction::Insert("10.0.0.1:50051".parse().unwrap())));
+        assert_eq!(
+            actions,
+            vec![EndpointAction::Insert(addr("10.0.0.1:50051"))]
+        );
     }
 
     #[test]
     fn process_event_delete_removes_known_endpoints() {
-        let slice = EndpointSlice {
-            endpoints: vec![make_endpoint(vec!["10.0.0.1", "10.0.0.2"], Some(true))],
-            ..Default::default()
-        };
+        let slice = slice_with("uid-1", &["10.0.0.1", "10.0.0.2"], Some(true));
 
-        let mut known = HashSet::new();
-        known.insert("10.0.0.1:50051".parse().unwrap());
-        known.insert("10.0.0.2:50051".parse().unwrap());
+        let mut state = DiscoveryState::default();
+        let _ = process_event(
+            &Event::Apply(slice.clone()),
+            &mut state,
+            &Port::Number(50051),
+        );
 
-        let actions = process_event(&Event::Delete(slice), &mut known, &Port::Number(50051));
+        let actions = process_event(&Event::Delete(slice), &mut state, &Port::Number(50051));
 
         assert_eq!(actions.len(), 2);
-        assert!(actions.contains(&EndpointAction::Remove("10.0.0.1:50051".parse().unwrap())));
-        assert!(actions.contains(&EndpointAction::Remove("10.0.0.2:50051".parse().unwrap())));
-        assert!(known.is_empty());
+        assert!(actions.contains(&EndpointAction::Remove(addr("10.0.0.1:50051"))));
+        assert!(actions.contains(&EndpointAction::Remove(addr("10.0.0.2:50051"))));
+        assert!(state.refcount.is_empty());
+        assert!(state.slices.is_empty());
     }
 
     #[test]
-    fn process_event_delete_skips_unknown_endpoints() {
-        let slice = EndpointSlice {
-            endpoints: vec![make_endpoint(vec!["10.0.0.1", "10.0.0.2"], Some(true))],
-            ..Default::default()
-        };
+    fn process_event_delete_unknown_slice_is_noop() {
+        let slice = slice_with("uid-unknown", &["10.0.0.1"], Some(true));
 
-        let mut known = HashSet::new();
-        known.insert("10.0.0.1:50051".parse().unwrap());
-        // 10.0.0.2 is not known
-
-        let actions = process_event(&Event::Delete(slice), &mut known, &Port::Number(50051));
-
-        // Only 10.0.0.1 should be removed since 10.0.0.2 wasn't known
-        assert_eq!(actions.len(), 1);
-        assert!(actions.contains(&EndpointAction::Remove("10.0.0.1:50051".parse().unwrap())));
-        assert!(known.is_empty());
-    }
-
-    #[test]
-    fn process_event_init_returns_empty() {
-        let mut known = HashSet::new();
-        let actions = process_event(&Event::Init, &mut known, &Port::Number(50051));
+        let mut state = DiscoveryState::default();
+        let actions = process_event(&Event::Delete(slice), &mut state, &Port::Number(50051));
 
         assert!(actions.is_empty());
     }
 
     #[test]
-    fn process_event_init_done_returns_empty() {
-        let mut known = HashSet::new();
-        let actions = process_event(&Event::InitDone, &mut known, &Port::Number(50051));
+    fn process_event_init_returns_empty_and_arms_seen() {
+        let mut state = DiscoveryState::default();
+        let actions = process_event(&Event::Init, &mut state, &Port::Number(50051));
 
         assert!(actions.is_empty());
+        assert!(state.init_seen.is_some());
+    }
+
+    #[test]
+    fn process_event_init_done_returns_empty_when_no_state() {
+        let mut state = DiscoveryState::default();
+        let _ = process_event(&Event::Init, &mut state, &Port::Number(50051));
+        let actions = process_event(&Event::InitDone, &mut state, &Port::Number(50051));
+
+        assert!(actions.is_empty());
+        assert!(state.init_seen.is_none());
+    }
+
+    /// Regression test for the production bug observed with Cerbos:
+    ///
+    /// When a pod is removed (rolling deploy, scale-down, crash) the
+    /// `EndpointSlice` is **updated**, not deleted. A subsequent
+    /// `Event::Apply` arrives with one fewer entry in `slice.endpoints`.
+    /// We must emit `Remove` for the dropped address so the tonic balance
+    /// channel stops routing to the dead pod IP.
+    #[test]
+    fn process_event_apply_removes_dropped_endpoints_from_same_slice() {
+        let slice_v1 = slice_with("uid-1", &["10.0.0.1", "10.0.0.2"], Some(true));
+        let slice_v2 = slice_with("uid-1", &["10.0.0.1"], Some(true));
+
+        let mut state = DiscoveryState::default();
+
+        let first = process_event(&Event::Apply(slice_v1), &mut state, &Port::Number(50051));
+        assert_eq!(first.len(), 2);
+        assert!(first.contains(&EndpointAction::Insert(addr("10.0.0.1:50051"))));
+        assert!(first.contains(&EndpointAction::Insert(addr("10.0.0.2:50051"))));
+
+        let second = process_event(&Event::Apply(slice_v2), &mut state, &Port::Number(50051));
+
+        assert_eq!(
+            second,
+            vec![EndpointAction::Remove(addr("10.0.0.2:50051"))],
+            "second Apply must emit Remove for the dropped 10.0.0.2 endpoint"
+        );
+        assert!(!state.refcount.contains_key(&addr("10.0.0.2:50051")));
+    }
+
+    /// An endpoint flipping `ready: true → false` (e.g. pod readiness
+    /// probe failing during graceful shutdown) must be removed from the
+    /// balance channel even though the slice itself is still present.
+    #[test]
+    fn process_event_apply_removes_endpoint_that_became_not_ready() {
+        let mut state = DiscoveryState::default();
+        let _ = process_event(
+            &Event::Apply(slice_with("uid-1", &["10.0.0.1"], Some(true))),
+            &mut state,
+            &Port::Number(50051),
+        );
+
+        let actions = process_event(
+            &Event::Apply(slice_with("uid-1", &["10.0.0.1"], Some(false))),
+            &mut state,
+            &Port::Number(50051),
+        );
+
+        assert_eq!(
+            actions,
+            vec![EndpointAction::Remove(addr("10.0.0.1:50051"))]
+        );
+    }
+
+    /// `terminating: true` must exclude the endpoint even when `ready`
+    /// briefly remains `true` during a graceful shutdown — this is the
+    /// upstream-recommended rule for load-balancer clients picking
+    /// targets for new connections.
+    #[test]
+    fn extract_ready_endpoints_skips_terminating() {
+        let slice = slice_with_terminating(
+            "uid-1",
+            &["10.0.0.1"],
+            Some(true), // ready still true
+            Some(true), // but terminating
+        );
+
+        let addrs = extract_ready_endpoints(&slice, &Port::Number(50051));
+        assert!(
+            addrs.is_empty(),
+            "terminating endpoints must be excluded even when ready=true"
+        );
+    }
+
+    /// A pod that flips into `terminating=true` while still ready must
+    /// be removed from the channel on the next Apply event.
+    #[test]
+    fn process_event_apply_removes_endpoint_that_became_terminating() {
+        let mut state = DiscoveryState::default();
+        let _ = process_event(
+            &Event::Apply(slice_with_terminating(
+                "uid-1",
+                &["10.0.0.1"],
+                Some(true),
+                Some(false),
+            )),
+            &mut state,
+            &Port::Number(50051),
+        );
+
+        let actions = process_event(
+            &Event::Apply(slice_with_terminating(
+                "uid-1",
+                &["10.0.0.1"],
+                Some(true),
+                Some(true),
+            )),
+            &mut state,
+            &Port::Number(50051),
+        );
+
+        assert_eq!(
+            actions,
+            vec![EndpointAction::Remove(addr("10.0.0.1:50051"))]
+        );
+    }
+
+    /// Multiple `EndpointSlice` shards can legitimately reference the
+    /// same address (e.g. dual-stack or sharding edge cases). Removing
+    /// it from one slice must NOT remove it from the channel while
+    /// another slice still references it.
+    #[test]
+    fn process_event_apply_keeps_endpoint_referenced_by_other_slice() {
+        let mut state = DiscoveryState::default();
+        let _ = process_event(
+            &Event::Apply(slice_with("uid-A", &["10.0.0.1"], Some(true))),
+            &mut state,
+            &Port::Number(50051),
+        );
+        let actions_b = process_event(
+            &Event::Apply(slice_with("uid-B", &["10.0.0.1"], Some(true))),
+            &mut state,
+            &Port::Number(50051),
+        );
+        assert!(
+            actions_b.is_empty(),
+            "address already inserted by slice A; second slice must not re-insert"
+        );
+
+        // Slice A is deleted; address must remain because slice B still has it.
+        let actions_del = process_event(
+            &Event::Delete(slice_with("uid-A", &["10.0.0.1"], Some(true))),
+            &mut state,
+            &Port::Number(50051),
+        );
+        assert!(
+            actions_del.is_empty(),
+            "address still referenced by slice B; must not emit Remove"
+        );
+        assert!(state.refcount.contains_key(&addr("10.0.0.1:50051")));
+
+        // Slice B is deleted; now the address must be removed.
+        let actions_final = process_event(
+            &Event::Delete(slice_with("uid-B", &["10.0.0.1"], Some(true))),
+            &mut state,
+            &Port::Number(50051),
+        );
+        assert_eq!(
+            actions_final,
+            vec![EndpointAction::Remove(addr("10.0.0.1:50051"))]
+        );
+    }
+
+    /// After a watcher disconnect, `Init` arms the seen-set and the
+    /// follow-up `InitApply` events declare the still-existing slices.
+    /// Slices that were known before the disconnect but NOT seen during
+    /// the init replay must be evicted on `InitDone`, otherwise dead
+    /// pod IPs that disappeared during the disconnect window stay in
+    /// the balance channel forever.
+    #[test]
+    fn process_event_init_done_evicts_slices_not_seen_during_replay() {
+        let mut state = DiscoveryState::default();
+
+        // Pre-disconnect: two slices known
+        let _ = process_event(
+            &Event::Apply(slice_with("uid-A", &["10.0.0.1"], Some(true))),
+            &mut state,
+            &Port::Number(50051),
+        );
+        let _ = process_event(
+            &Event::Apply(slice_with("uid-B", &["10.0.0.2"], Some(true))),
+            &mut state,
+            &Port::Number(50051),
+        );
+
+        // Watcher reconnects: only uid-A still exists upstream
+        let _ = process_event(&Event::Init, &mut state, &Port::Number(50051));
+        let _ = process_event(
+            &Event::InitApply(slice_with("uid-A", &["10.0.0.1"], Some(true))),
+            &mut state,
+            &Port::Number(50051),
+        );
+        let actions = process_event(&Event::InitDone, &mut state, &Port::Number(50051));
+
+        assert_eq!(
+            actions,
+            vec![EndpointAction::Remove(addr("10.0.0.2:50051"))],
+            "uid-B was not seen during init replay and must be evicted"
+        );
+        assert!(state.refcount.contains_key(&addr("10.0.0.1:50051")));
+        assert!(!state.refcount.contains_key(&addr("10.0.0.2:50051")));
     }
 }
