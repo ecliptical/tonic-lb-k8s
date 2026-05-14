@@ -240,15 +240,26 @@ tonic-lb-k8s = { version = "0.1", features = ["tls-webpki-roots"] }
        only when both slices drop it
      - watcher restart: `Init` / `InitApply` / `InitDone` evicts slices
        not seen during replay
+   - `run_event_stream()` - drives the loop end-to-end against a
+     synthetic `Stream<Item = Result<Event<EndpointSlice>, _>>` and a
+     real `tokio::sync::mpsc` Sender. Covers:
+     - Insert delivery for `Apply`
+     - the prod regression at the channel boundary (apply→apply emits
+       `Change::Remove` to the receiver)
+     - `Init`/`InitApply`/`InitDone` reconcile delivers `Remove`
+     - clean exit (`Ok(())`) when the receiver is dropped
+     - stream errors propagate as `Err`
+     - the user-supplied `build` closure is invoked exactly once per
+       `Insert` and never for a `Remove`
 
 2. **Coverage target**: 80%+
 
 3. **Untestable without cluster** (today):
-   - `discover()` - spawns async task
-   - `discovery_loop()` - requires Kubernetes API
-   - A future improvement is to drive `discovery_loop` against a mocked
-     `tower::Service` (`tower-test`) feeding a scripted watch stream;
-     this would cover backoff and async ordering without a real cluster
+   - `discover()` - spawns an async task; trivially wraps
+     `discovery_loop`
+   - `discovery_loop()` - the kube `Client::try_default()` +
+     `watcher::watcher` setup; the loop body itself is now exercised
+     by the `run_event_stream` tests above
 
 ## CI/CD
 

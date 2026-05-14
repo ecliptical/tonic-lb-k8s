@@ -33,7 +33,7 @@
 //! let client = MyServiceClient::new(channel);
 //! ```
 
-use futures::TryStreamExt as _;
+use futures::{Stream, TryStreamExt as _};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::WatchStreamExt as _;
 use kube::runtime::watcher::{self, Config as WatcherConfig, Event};
@@ -179,17 +179,48 @@ where
     let label_selector = format!("kubernetes.io/service-name={}", config.service_name);
     let watcher_config = WatcherConfig::default().labels(&label_selector);
 
-    let mut state = DiscoveryState::default();
     let stream = watcher::watcher(slices, watcher_config).default_backoff();
-    tokio::pin!(stream);
 
     debug!(
         "Starting Kubernetes endpoint watch for {namespace}/{} on port {:?}",
         config.service_name, config.port
     );
 
-    while let Some(event) = stream.try_next().await? {
-        let actions = process_event(&event, &mut state, &config.port);
+    run_event_stream(
+        stream,
+        tx,
+        build,
+        &config.port,
+        &namespace,
+        &config.service_name,
+    )
+    .await
+}
+
+/// Drives a stream of `EndpointSlice` watch events, updating the provided
+/// `Sender` with `Change::Insert` / `Change::Remove` actions.
+///
+/// Extracted from [`discovery_loop`] so it can be unit-tested without a
+/// real Kubernetes API server: tests pass a synthetic `Stream` of
+/// `Event<EndpointSlice>` values via `futures::stream::iter`.
+async fn run_event_stream<S, E, F>(
+    stream: S,
+    tx: Sender<Change<SocketAddr, Endpoint>>,
+    build: F,
+    port: &Port,
+    namespace: &str,
+    service_name: &str,
+) -> Result<()>
+where
+    S: Stream<Item = std::result::Result<Event<EndpointSlice>, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+    F: Fn(SocketAddr) -> Endpoint,
+{
+    let mut state = DiscoveryState::default();
+    tokio::pin!(stream);
+
+    while let Some(event) = stream.try_next().await.map_err(|e| Box::new(e) as Error)? {
+        let actions = process_event(&event, &mut state, port);
 
         for action in actions {
             let change = match action {
@@ -204,9 +235,8 @@ where
         }
 
         debug!(
-            "Kubernetes discovery: {} endpoints for {namespace}/{}",
+            "Kubernetes discovery: {} endpoints for {namespace}/{service_name}",
             state.refcount.len(),
-            config.service_name
         );
     }
 
@@ -421,7 +451,13 @@ fn extract_ready_endpoints(slice: &EndpointSlice, port: &Port) -> HashSet<Socket
 
 #[cfg(test)]
 mod tests {
+    use futures::stream;
     use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use tonic::transport::Endpoint as TonicEndpoint;
 
     use super::*;
 
@@ -1030,5 +1066,213 @@ mod tests {
         );
         assert!(state.refcount.contains_key(&addr("10.0.0.1:50051")));
         assert!(!state.refcount.contains_key(&addr("10.0.0.2:50051")));
+    }
+
+    // run_event_stream tests: drive the discovery loop end-to-end against
+    // a synthetic stream and a real `tokio::sync::mpsc` Sender, with no
+    // Kubernetes API server. Covers the full code path that the prod
+    // `discovery_loop` runs (process_event + send) and the build closure.
+
+    fn build_endpoint(addr: SocketAddr) -> TonicEndpoint {
+        TonicEndpoint::from_shared(format!("http://{addr}")).expect("valid endpoint")
+    }
+
+    /// Convenience: collect every `Change` the receiver currently has,
+    /// reducing each to the simpler `EndpointAction` for assertions.
+    async fn drain(
+        rx: &mut mpsc::Receiver<Change<SocketAddr, TonicEndpoint>>,
+    ) -> Vec<EndpointAction> {
+        let mut out = Vec::new();
+        while let Ok(Some(change)) =
+            tokio::time::timeout(Duration::from_millis(100), rx.recv()).await
+        {
+            out.push(match change {
+                Change::Insert(a, _) => EndpointAction::Insert(a),
+                Change::Remove(a) => EndpointAction::Remove(a),
+            });
+        }
+        out
+    }
+
+    /// Stream of `Ok(Event)` items with `std::io::Error` as the error
+    /// type so the helper's generic `E: std::error::Error` bound is
+    /// satisfied.
+    fn ok_events(
+        events: Vec<Event<EndpointSlice>>,
+    ) -> impl Stream<Item = std::result::Result<Event<EndpointSlice>, std::io::Error>> {
+        stream::iter(events.into_iter().map(Ok))
+    }
+
+    #[tokio::test]
+    async fn run_event_stream_emits_inserts_for_apply() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let events = vec![Event::Apply(slice_with(
+            "uid-1",
+            &["10.0.0.1", "10.0.0.2"],
+            Some(true),
+        ))];
+
+        run_event_stream(
+            ok_events(events),
+            tx,
+            build_endpoint,
+            &Port::Number(50051),
+            "default",
+            "svc",
+        )
+        .await
+        .expect("loop completes");
+
+        let actions = drain(&mut rx).await;
+        assert_eq!(actions.len(), 2);
+        assert!(actions.contains(&EndpointAction::Insert(addr("10.0.0.1:50051"))));
+        assert!(actions.contains(&EndpointAction::Insert(addr("10.0.0.2:50051"))));
+    }
+
+    /// End-to-end regression for the production bug: an Apply with
+    /// fewer endpoints than the previous Apply must surface a `Remove`
+    /// on the receiver side, not just internally in `process_event`.
+    #[tokio::test]
+    async fn run_event_stream_emits_remove_when_apply_drops_endpoint() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let events = vec![
+            Event::Apply(slice_with("uid-1", &["10.0.0.1", "10.0.0.2"], Some(true))),
+            Event::Apply(slice_with("uid-1", &["10.0.0.1"], Some(true))),
+        ];
+
+        run_event_stream(
+            ok_events(events),
+            tx,
+            build_endpoint,
+            &Port::Number(50051),
+            "default",
+            "svc",
+        )
+        .await
+        .expect("loop completes");
+
+        let actions = drain(&mut rx).await;
+        // Order matters: both Inserts before the Remove.
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[2], EndpointAction::Remove(addr("10.0.0.2:50051")));
+    }
+
+    /// `Init` -> `InitApply` -> `InitDone` over the wire, with one
+    /// pre-existing slice that doesn't get replayed. Verifies the
+    /// reconcile Remove makes it through the channel.
+    #[tokio::test]
+    async fn run_event_stream_init_done_evicts_unseen_slices() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let events = vec![
+            // Cold-start state from a previous watcher session
+            Event::Apply(slice_with("uid-A", &["10.0.0.1"], Some(true))),
+            Event::Apply(slice_with("uid-B", &["10.0.0.2"], Some(true))),
+            // Watcher reconnects; only uid-A still exists upstream.
+            Event::Init,
+            Event::InitApply(slice_with("uid-A", &["10.0.0.1"], Some(true))),
+            Event::InitDone,
+        ];
+
+        run_event_stream(
+            ok_events(events),
+            tx,
+            build_endpoint,
+            &Port::Number(50051),
+            "default",
+            "svc",
+        )
+        .await
+        .expect("loop completes");
+
+        let actions = drain(&mut rx).await;
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0], EndpointAction::Insert(addr("10.0.0.1:50051")));
+        assert_eq!(actions[1], EndpointAction::Insert(addr("10.0.0.2:50051")));
+        assert_eq!(actions[2], EndpointAction::Remove(addr("10.0.0.2:50051")));
+    }
+
+    /// If the receiver is dropped, the loop must exit cleanly with
+    /// `Ok(())` instead of panicking or returning an error. Mirrors
+    /// what happens when the user-side balance channel goes away.
+    #[tokio::test]
+    async fn run_event_stream_returns_ok_when_receiver_dropped() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        let events = vec![Event::Apply(slice_with("uid-1", &["10.0.0.1"], Some(true)))];
+
+        let result = run_event_stream(
+            ok_events(events),
+            tx,
+            build_endpoint,
+            &Port::Number(50051),
+            "default",
+            "svc",
+        )
+        .await;
+
+        assert!(result.is_ok(), "must exit cleanly when receiver is dropped");
+    }
+
+    /// Stream errors (e.g. apiserver disconnects past the backoff
+    /// retries) must propagate as `Err`, not be swallowed.
+    #[tokio::test]
+    async fn run_event_stream_propagates_stream_error() {
+        let (tx, _rx) = mpsc::channel(16);
+        let err = std::io::Error::other("watch failed");
+        let events: Vec<std::result::Result<Event<EndpointSlice>, std::io::Error>> = vec![
+            Ok(Event::Apply(slice_with("uid-1", &["10.0.0.1"], Some(true)))),
+            Err(err),
+        ];
+
+        let result = run_event_stream(
+            stream::iter(events),
+            tx,
+            build_endpoint,
+            &Port::Number(50051),
+            "default",
+            "svc",
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    /// The user-supplied `build` closure must be called exactly once
+    /// per `Insert` and never for a `Remove`. This guards against
+    /// regressions that would either build a fresh `Endpoint` for
+    /// every event (wasteful, breaks tonic's connection reuse) or
+    /// skip building entirely (panics downstream).
+    #[tokio::test]
+    async fn run_event_stream_invokes_build_only_for_inserts() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+
+        let events = vec![
+            Event::Apply(slice_with("uid-1", &["10.0.0.1", "10.0.0.2"], Some(true))),
+            Event::Apply(slice_with("uid-1", &["10.0.0.1"], Some(true))),
+        ];
+
+        run_event_stream(
+            ok_events(events),
+            tx,
+            move |a| {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+                build_endpoint(a)
+            },
+            &Port::Number(50051),
+            "default",
+            "svc",
+        )
+        .await
+        .expect("loop completes");
+
+        let _ = drain(&mut rx).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "build must be invoked once per Insert (2), never for the Remove"
+        );
     }
 }
