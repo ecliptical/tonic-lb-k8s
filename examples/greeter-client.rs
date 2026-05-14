@@ -79,12 +79,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start endpoint discovery
-    // The build function creates an Endpoint for each discovered pod address
+    // The build function creates an Endpoint for each discovered pod address.
+    //
+    // The HTTP/2 keep-alive settings below are recommended for production:
+    // they ensure idle connections to a removed pod are torn down promptly
+    // instead of failing the next request with `Unavailable`. See the
+    // "Production Hardening" section of the top-level README for details.
     discover(config, tx, |addr| {
         Endpoint::from_shared(format!("http://{addr}"))
             .expect("valid endpoint URI")
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .keep_alive_timeout(Duration::from_secs(20))
+            .keep_alive_while_idle(true)
     });
 
     // Wait a bit for initial endpoint discovery

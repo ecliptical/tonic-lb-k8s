@@ -71,12 +71,14 @@ pub enum Port {
 
 ### 6. Testable Event Processing
 
-**Decision**: Extract `process_event()` as a separate sync function returning `Vec<EndpointAction>`.
+**Decision**: Extract `process_event()` as a separate sync function returning `Vec<EndpointAction>`, with state held in a dedicated `DiscoveryState` struct.
 
 **Rationale**:
 - The async `discovery_loop()` requires a real Kubernetes cluster
 - By extracting the event processing logic, we can unit test it
-- Achieved 87%+ code coverage without integration tests
+- Per-slice address tracking + global refcount are needed to correctly
+  diff `Apply` events against previous state and handle multi-slice
+  Services without spurious `Remove`s
 
 ```rust
 enum EndpointAction {
@@ -84,12 +86,35 @@ enum EndpointAction {
     Remove(SocketAddr),
 }
 
+struct DiscoveryState {
+    /// Per-slice (UID) -> last-known address set
+    slices: HashMap<String, HashSet<SocketAddr>>,
+    /// Refcount of each address across slices; emit Remove only at 0
+    refcount: HashMap<SocketAddr, usize>,
+    /// Slice UIDs seen during the current Init -> InitDone window
+    init_seen: Option<HashSet<String>>,
+}
+
 fn process_event(
     event: &Event<EndpointSlice>,
-    known: &mut HashSet<SocketAddr>,
+    state: &mut DiscoveryState,
     port: &Port,
 ) -> Vec<EndpointAction>
 ```
+
+**Why per-slice + refcount**: An `Apply` event delivers the full slice,
+not a delta. To know what was removed we have to diff against the
+slice's previous contents. A Service can also be backed by multiple
+`EndpointSlice` objects (the controller shards at ~100 endpoints, and
+typically one slice per address family); the same address may appear in
+more than one slice, so we must only emit `Remove` once the last slice
+referencing it drops it.
+
+**Why `Init`/`InitDone` reconciliation**: The kube `watcher` re-lists
+on reconnect and replays current state via `InitApply` framed by
+`Init`/`InitDone`. Slices that disappeared while we were disconnected
+must be evicted on `InitDone`, otherwise their addresses leak into the
+balance channel forever.
 
 ## Code Patterns
 
@@ -205,14 +230,25 @@ tonic-lb-k8s = { version = "0.1", features = ["tls-webpki-roots"] }
 1. **Unit tests** for:
    - `Port` conversions
    - `DiscoveryConfig` builder
-   - `extract_ready_endpoints()` - various slice configurations
-   - `process_event()` - all event types and state transitions
+   - `extract_ready_endpoints()` - various slice configurations,
+     including `terminating=true` exclusion
+   - `process_event()` - all event types AND state transitions:
+     - apply→apply with fewer endpoints (regression for the production
+       Cerbos failure)
+     - `ready: true → false` and `terminating: false → true` flips
+     - multi-slice refcount: address held by two slices is removed
+       only when both slices drop it
+     - watcher restart: `Init` / `InitApply` / `InitDone` evicts slices
+       not seen during replay
 
 2. **Coverage target**: 80%+
 
-3. **Untestable without cluster**:
+3. **Untestable without cluster** (today):
    - `discover()` - spawns async task
    - `discovery_loop()` - requires Kubernetes API
+   - A future improvement is to drive `discovery_loop` against a mocked
+     `tower::Service` (`tower-test`) feeding a scripted watch stream;
+     this would cover backoff and async ordering without a real cluster
 
 ## CI/CD
 
@@ -232,5 +268,12 @@ The project went through several refinements:
 2. Increased test coverage by extracting testable `process_event()`
 3. TLS configuration: `aws-lc-rs` alone is insufficient; need `rustls-tls` + `aws-lc-rs`
 4. Root certificates: Added `tls-native-roots` and `tls-webpki-roots` features to coordinate root certificate configuration for both kube and tonic dependencies
+5. **0.1.1 — Endpoint removal correctness fix.** The original
+   `process_event` only emitted `Remove` on whole-slice deletion, so
+   pod removals from a still-present slice (the common case in
+   rollouts) leaked dead IPs into the tonic balance channel and
+   surfaced as intermittent 5xx in production. Replaced with per-slice
+   diff + refcount via `DiscoveryState`, added `terminating` handling,
+   and added watcher-restart reconciliation via `Init`/`InitDone`.
 
 The guiding principle was **simplicity over flexibility** when the flexibility wasn't clearly needed.

@@ -17,10 +17,19 @@ spec:
       labels:
         app: greeter-server
     spec:
+      # Allow in-flight RPCs to drain on SIGTERM. The preStop sleep
+      # gives kubelet time to flip EndpointConditions.terminating=true
+      # so clients (including ones using tonic-lb-k8s) stop picking
+      # this pod for new connections before the server actually exits.
+      terminationGracePeriodSeconds: 30
       containers:
         - name: greeter-server
           image: greeter-server:latest
           imagePullPolicy: IfNotPresent
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 5"]
           ports:
             - name: grpc
               containerPort: 50051

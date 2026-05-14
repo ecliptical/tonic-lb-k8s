@@ -180,6 +180,30 @@ rules:
     verbs: ["list", "watch"]
 ```
 
+## Production Hardening (applied in this example)
+
+The example server `Deployment` (`k8s/server-deployment.yaml`) is
+intentionally configured the way you would run a production gRPC
+service behind `tonic-lb-k8s`:
+
+- **`terminationGracePeriodSeconds: 30`** — gives in-flight RPCs time
+  to drain after SIGTERM.
+- **`lifecycle.preStop` with a short `sleep`** — gives kubelet a chance
+  to flip the pod's `EndpointConditions.terminating` to `true` and
+  propagate it through the `EndpointSlice` controller before the
+  container actually starts refusing new streams. The discovery side
+  in this crate excludes terminating endpoints (since v0.1.1), so the
+  preStop window is what makes that exclusion observable to the client
+  before the server stops.
+- **`readinessProbe`** — when the probe fails (during shutdown, slow
+  startup, or transient backpressure), kubelet flips
+  `EndpointConditions.ready` to `false`, and `tonic-lb-k8s` will emit
+  a `Change::Remove` for that pod's address on the next watch event.
+
+For client-side hardening — TLS SNI when targeting pod IPs, HTTP/2
+keep-alive settings, and idempotent retry — see the **Production
+Hardening** section in the [top-level README](../README.md).
+
 ## Expected Output
 
 After deployment, the client job output should look like:

@@ -1,7 +1,7 @@
 [package]
 name = "tonic-lb-k8s"
 description = "Tonic client load balancing for Kubernetes"
-version = "0.1.0"
+version = "0.1.1"
 repository = "https://github.com/ecliptical/tonic-lb-k8s"
 authors = ["Peter Nehrer <pnehrer@eclipticalsoftware.com>"]
 license = "MIT"
