@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-06-16
+
+### Changed
+
+- **Upgraded `kube` from 3 to 4 and `k8s-openapi` from 0.27 to 0.28**
+  (Kubernetes API feature `v1_31` → `v1_32`). Because `kube` types
+  appear in this crate's public API, downstream consumers must move to
+  `kube` 4 in lockstep; this is a breaking change for them, hence the
+  minor bump on 0.x.
+
 ## [0.1.1] - 2026-05-14
 
 ### Fixed
@@ -64,5 +74,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Dockerfiles, kind cluster setup, Kubernetes manifests, and a
   deploy script.
 
+[0.2.0]: https://github.com/ecliptical/tonic-lb-k8s/releases/tag/v0.2.0
 [0.1.1]: https://github.com/ecliptical/tonic-lb-k8s/releases/tag/v0.1.1
 [0.1.0]: https://github.com/ecliptical/tonic-lb-k8s/releases/tag/v0.1.0
